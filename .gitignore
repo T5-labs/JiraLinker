@@ -1,0 +1,8 @@
+# .NET build output
+bin/
+obj/
+dist/
+*.user
+
+# Published artifacts (built locally / attached to GitHub Releases instead)
+publish/
