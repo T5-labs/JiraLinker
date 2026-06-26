@@ -2,7 +2,7 @@
 
 Type a Jira ticket like `CMMS-2747`, hit space, and it instantly becomes a clickable link to that ticket — **in any app on Windows** (Teams, Outlook, Slack, Word, …).
 
-It's a tiny system-tray app: it watches what you type, and when it sees `CMMS-####` or `MCP-####` followed by space / Enter / Tab / `.` / `,`, it replaces the text with a named hyperlink (the text still reads `CMMS-2747`, but it links to `https://herzog.atlassian.net/browse/CMMS-2747`).
+It's a tiny system-tray app: it watches what you type, and when it sees `CMMS-####` or `MCP-####` followed by **any non-letter/digit character** — a space, Enter, Tab, or any punctuation/symbol (`.`, `,`, `)`, `!`, `?`, `:`, `/`, …) — it replaces the text with a named hyperlink (the text still reads `CMMS-2747`, but it links to `https://herzog.atlassian.net/browse/CMMS-2747`). The character you typed is preserved, so `(CMMS-2747)` or `CMMS-2747!` come out exactly as you'd expect.
 
 ---
 
@@ -60,7 +60,7 @@ Everything lives in [`Program.cs`](Program.cs):
   ```csharp
   private const string BaseUrl = "https://herzog.atlassian.net/browse/";
   ```
-- **Change trigger keys** — see `UnicodeTrigger(...)` (space / `.` / `,`) plus Enter/Tab handling in `HookCallback`.
+- **Change trigger behavior** — the trigger is "any printable non-token character" (see `TryGetPrintableChar(...)` plus the Enter/Tab handling in `HookCallback`). Token characters (letters, digits, `-`) are defined in `BufferChar(...)`.
 
 Rebuild with `scripts\build.ps1` after any change.
 

@@ -94,7 +94,10 @@ sealed class KeyHook : IDisposable
     private readonly LowLevelKeyboardProc _proc; // kept alive to avoid GC of the callback
     private IntPtr _hookId = IntPtr.Zero;
     private readonly StringBuilder _buf = new();
-    private bool _shift, _ctrl, _alt, _win;
+    private readonly StringBuilder _charBuf = new(8); // scratch for ToUnicodeEx
+    private bool _lShift, _rShift, _ctrl, _alt, _win;
+
+    private bool Shift => _lShift || _rShift;
 
     private readonly System.Windows.Forms.Timer _restoreTimer;
     private DataObject? _savedClipboard;
@@ -132,7 +135,8 @@ sealed class KeyHook : IDisposable
         bool isUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
 
         // Track modifier state (physical), always pass through.
-        if (IsShift(vk)) { if (isDown) _shift = true; else if (isUp) _shift = false; return CallNextHookEx(_hookId, nCode, wParam, lParam); }
+        if (vk == 0xA1) { if (isDown) _rShift = true; else if (isUp) _rShift = false; return CallNextHookEx(_hookId, nCode, wParam, lParam); }
+        if (vk == 0x10 || vk == 0xA0) { if (isDown) _lShift = true; else if (isUp) _lShift = false; return CallNextHookEx(_hookId, nCode, wParam, lParam); }
         if (IsCtrl(vk))  { if (isDown) _ctrl  = true; else if (isUp) _ctrl  = false; return CallNextHookEx(_hookId, nCode, wParam, lParam); }
         if (IsAlt(vk))   { if (isDown) _alt   = true; else if (isUp) _alt   = false; return CallNextHookEx(_hookId, nCode, wParam, lParam); }
         if (IsWin(vk))   { if (isDown) _win   = true; else if (isUp) _win   = false; return CallNextHookEx(_hookId, nCode, wParam, lParam); }
@@ -155,8 +159,8 @@ sealed class KeyHook : IDisposable
             return CallNextHookEx(_hookId, nCode, wParam, lParam);
         }
 
-        // Characters that are part of a ticket token.
-        char? bufferChar = BufferChar(vk, _shift);
+        // Characters that are part of a ticket token (letters, digits, hyphen).
+        char? bufferChar = BufferChar(vk, Shift);
         if (bufferChar.HasValue)
         {
             _buf.Append(bufferChar.Value);
@@ -164,13 +168,15 @@ sealed class KeyHook : IDisposable
             return CallNextHookEx(_hookId, nCode, wParam, lParam);
         }
 
-        // Word-boundary keys that should trigger a rewrite.
+        // Enter / Tab end the word and are re-emitted as virtual keys.
+        // Any other key that produces a printable character (space and every
+        // punctuation/symbol) is also a trigger and is re-emitted as that character.
         bool isEnter = vk == VK_RETURN;
         bool isTab = vk == VK_TAB;
-        char? unicodeTrigger = UnicodeTrigger(vk, _shift); // space / . / ,
-        bool isTrigger = isEnter || isTab || unicodeTrigger.HasValue;
+        char triggerChar = '\0';
+        bool isPrintable = !isEnter && !isTab && TryGetPrintableChar((uint)vk, data.scanCode, out triggerChar);
 
-        if (isTrigger)
+        if (isEnter || isTab || isPrintable)
         {
             var m = Pattern.Match(_buf.ToString());
             if (m.Success)
@@ -179,14 +185,14 @@ sealed class KeyHook : IDisposable
                 string display = m.Groups[1].Value.ToUpperInvariant() + "-" + m.Groups[2].Value;
                 string url = BaseUrl + display;
                 _buf.Clear();
-                ReplaceWithLink(tokenLen, url, display, vk, unicodeTrigger);
+                ReplaceWithLink(tokenLen, url, display, vk, isPrintable ? triggerChar : null);
                 return (IntPtr)1; // swallow the original key; we re-emit it after pasting the link
             }
             _buf.Clear();
             return CallNextHookEx(_hookId, nCode, wParam, lParam);
         }
 
-        // Anything else (arrows, Esc, function keys, other punctuation) ends the word.
+        // Anything else (arrows, Esc, function keys, etc.) just ends the word.
         _buf.Clear();
         return CallNextHookEx(_hookId, nCode, wParam, lParam);
     }
@@ -202,13 +208,29 @@ sealed class KeyHook : IDisposable
         return null;
     }
 
-    /// <summary>Trigger keys re-emitted as Unicode (space, period, comma); null otherwise.</summary>
-    private static char? UnicodeTrigger(int vk, bool shift)
+    /// <summary>
+    /// Resolves the printable character a key would produce given the current Shift
+    /// state, honoring the active keyboard layout. Returns false for keys that don't
+    /// produce a simple printable char (Enter, Tab, arrows, function keys, dead keys…).
+    /// </summary>
+    private bool TryGetPrintableChar(uint vk, uint scanCode, out char c)
     {
-        if (vk == VK_SPACE) return ' ';
-        if (vk == VK_OEM_PERIOD) return shift ? null : '.';
-        if (vk == VK_OEM_COMMA) return shift ? null : ',';
-        return null;
+        c = '\0';
+        var keyState = new byte[256];
+        if (Shift) { keyState[0x10] = 0x80; keyState[0xA0] = 0x80; }
+
+        // Layout of the window actually receiving input.
+        IntPtr hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero));
+
+        _charBuf.Clear();
+        // wFlags bit 2 (0x4): don't mutate the kernel keyboard state (avoids breaking dead keys).
+        int rc = ToUnicodeEx(vk, scanCode, keyState, _charBuf, _charBuf.Capacity, 0x4, hkl);
+        if (rc == 1)
+        {
+            char ch = _charBuf[0];
+            if (ch >= 0x20 && ch != 0x7F) { c = ch; return true; } // printable, excludes control chars/DEL
+        }
+        return false;
     }
 
     /// <summary>
@@ -244,17 +266,30 @@ sealed class KeyHook : IDisposable
         try { Clipboard.SetDataObject(payload, true); }
         catch { _restorePending = false; SendReplacement(backspaces, url, vk, unicodeTrigger); return; }
 
-        var inputs = new List<INPUT>(backspaces * 2 + 6);
+        // If Shift is physically held (e.g. the trigger was a shifted symbol like ")"),
+        // release it so the synthetic Ctrl+V doesn't become Ctrl+Shift+V (paste-as-text
+        // in many apps). We restore it afterwards so the OS state matches the real key.
+        bool lShift = _lShift, rShift = _rShift;
+
+        var inputs = new List<INPUT>(backspaces * 2 + 10);
+        if (lShift) inputs.Add(KeyVk(VK_LSHIFT, true));
+        if (rShift) inputs.Add(KeyVk(VK_RSHIFT, true));
+
         for (int i = 0; i < backspaces; i++)
         {
             inputs.Add(KeyVk(VK_BACK, false));
             inputs.Add(KeyVk(VK_BACK, true));
         }
-        // Ctrl+V
+        // Ctrl+V (with Shift released)
         inputs.Add(KeyVk(VK_CONTROL, false));
         inputs.Add(KeyVk(VK_V, false));
         inputs.Add(KeyVk(VK_V, true));
         inputs.Add(KeyVk(VK_CONTROL, true));
+
+        // Restore the physical Shift state before re-emitting, so Shift+Enter etc. survive.
+        if (lShift) inputs.Add(KeyVk(VK_LSHIFT, false));
+        if (rShift) inputs.Add(KeyVk(VK_RSHIFT, false));
+
         // Re-emit the boundary key the user pressed.
         if (vk == VK_RETURN) { inputs.Add(KeyVk(VK_RETURN, false)); inputs.Add(KeyVk(VK_RETURN, true)); }
         else if (vk == VK_TAB) { inputs.Add(KeyVk(VK_TAB, false)); inputs.Add(KeyVk(VK_TAB, true)); }
@@ -352,7 +387,6 @@ sealed class KeyHook : IDisposable
         U = new InputUnion { ki = new KEYBDINPUT { wScan = c, dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0) } }
     };
 
-    private static bool IsShift(int vk) => vk == 0x10 || vk == 0xA0 || vk == 0xA1;
     private static bool IsCtrl(int vk) => vk == 0x11 || vk == 0xA2 || vk == 0xA3;
     private static bool IsAlt(int vk) => vk == 0x12 || vk == 0xA4 || vk == 0xA5;
     private static bool IsWin(int vk) => vk == 0x5B || vk == 0x5C;
@@ -378,7 +412,7 @@ sealed class KeyHook : IDisposable
 
     private const int VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SPACE = 0x20;
     private const int VK_OEM_MINUS = 0xBD, VK_OEM_COMMA = 0xBC, VK_OEM_PERIOD = 0xBE, VK_SUBTRACT = 0x6D;
-    private const ushort VK_CONTROL = 0x11, VK_V = 0x56;
+    private const ushort VK_CONTROL = 0x11, VK_V = 0x56, VK_LSHIFT = 0xA0, VK_RSHIFT = 0xA1;
 
     private const uint INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
@@ -424,4 +458,17 @@ sealed class KeyHook : IDisposable
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    private static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState,
+        [Out] StringBuilder pwszBuff, int cchBuff, uint wFlags, IntPtr dwhkl);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
 }
