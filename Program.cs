@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace JiraLinker;
@@ -27,6 +28,7 @@ sealed class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon _icon;
     private readonly KeyHook _hook;
+    private SettingsForm? _settings;
 
     public TrayContext()
     {
@@ -39,14 +41,16 @@ sealed class TrayContext : ApplicationContext
         toggle.CheckedChanged += (_, _) =>
         {
             _hook.Enabled = toggle.Checked;
-            _icon.Text = toggle.Checked
-                ? "Jira Linker — on (CMMS-#### , MCP-####)"
-                : "Jira Linker — paused";
+            _icon.Text = toggle.Checked ? "Jira Linker — on" : "Jira Linker — paused";
         };
         menu.Items.Add(toggle);
 
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("Type CMMS-#### or MCP-#### then space") { Enabled = false });
+
+        var manage = new ToolStripMenuItem("Manage projects…");
+        manage.Click += (_, _) => ShowSettings();
+        menu.Items.Add(manage);
+
         menu.Items.Add(new ToolStripSeparator());
 
         var exit = new ToolStripMenuItem("Exit");
@@ -57,9 +61,23 @@ sealed class TrayContext : ApplicationContext
         {
             Icon = SystemIcons.Information,
             Visible = true,
-            Text = "Jira Linker — on (CMMS-#### , MCP-####)",
+            Text = "Jira Linker — on",
             ContextMenuStrip = menu
         };
+        // Double-clicking the tray icon opens the project manager too.
+        _icon.DoubleClick += (_, _) => ShowSettings();
+    }
+
+    private void ShowSettings()
+    {
+        if (_settings is { IsDisposed: false })
+        {
+            _settings.Activate();
+            return;
+        }
+        _settings = new SettingsForm(_hook.GetProjects(), _hook.SetProjects);
+        _settings.Show();
+        _settings.Activate();
     }
 
     protected override void Dispose(bool disposing)
@@ -84,12 +102,9 @@ sealed class TrayContext : ApplicationContext
 /// </summary>
 sealed class KeyHook : IDisposable
 {
-    private const string BaseUrl = "https://herzog.atlassian.net/browse/";
-
-    // Ticket token at the end of the buffer, not glued to a preceding alphanumeric.
-    private static readonly Regex Pattern =
-        new(@"(?<![A-Za-z0-9])(CMMS|MCP)-(\d+)$",
-            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // Current set of project prefixes -> URL templates, compiled into one regex.
+    // Swapped atomically when the user edits projects (read on the same UI thread).
+    private ProjectSet _projects = ProjectSet.Build(ConfigStore.Load());
 
     private readonly LowLevelKeyboardProc _proc; // kept alive to avoid GC of the callback
     private IntPtr _hookId = IntPtr.Zero;
@@ -120,6 +135,17 @@ sealed class KeyHook : IDisposable
         if (_hookId == IntPtr.Zero)
             throw new InvalidOperationException(
                 $"Failed to install keyboard hook (error {Marshal.GetLastWin32Error()}).");
+    }
+
+    /// <summary>A copy of the current projects, for display/editing in the UI.</summary>
+    public List<Project> GetProjects() => _projects.Projects.Select(p => p.Clone()).ToList();
+
+    /// <summary>Applies an edited project list: recompiles the matcher and saves to disk.</summary>
+    public void SetProjects(IEnumerable<Project> projects)
+    {
+        var list = projects.ToList();
+        _projects = ProjectSet.Build(list);
+        ConfigStore.Save(list);
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -178,12 +204,14 @@ sealed class KeyHook : IDisposable
 
         if (isEnter || isTab || isPrintable)
         {
-            var m = Pattern.Match(_buf.ToString());
-            if (m.Success)
+            var projects = _projects;
+            var m = projects.Pattern?.Match(_buf.ToString());
+            if (m is { Success: true })
             {
+                string prefix = m.Groups[1].Value.ToUpperInvariant();
+                string display = prefix + "-" + m.Groups[2].Value;
+                string url = projects.BuildUrl(prefix, display);
                 int tokenLen = m.Value.Length;
-                string display = m.Groups[1].Value.ToUpperInvariant() + "-" + m.Groups[2].Value;
-                string url = BaseUrl + display;
                 _buf.Clear();
                 ReplaceWithLink(tokenLen, url, display, vk, isPrintable ? triggerChar : null);
                 return (IntPtr)1; // swallow the original key; we re-emit it after pasting the link
@@ -471,4 +499,220 @@ sealed class KeyHook : IDisposable
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
+}
+
+/// <summary>One project prefix and the URL it links to. {KEY} = the full ticket id.</summary>
+sealed class Project
+{
+    public string Prefix { get; set; } = "";
+    public string UrlTemplate { get; set; } = "https://herzog.atlassian.net/browse/{KEY}";
+    public Project Clone() => new() { Prefix = Prefix, UrlTemplate = UrlTemplate };
+}
+
+/// <summary>Immutable, compiled snapshot of the projects used by the hook for matching.</summary>
+sealed class ProjectSet
+{
+    private const string FallbackTemplate = "https://herzog.atlassian.net/browse/{KEY}";
+
+    public List<Project> Projects { get; }
+    public Regex? Pattern { get; }                 // null when there are no projects
+    private readonly Dictionary<string, string> _templates; // UPPER prefix -> template
+
+    private ProjectSet(List<Project> projects, Regex? pattern, Dictionary<string, string> templates)
+    {
+        Projects = projects;
+        Pattern = pattern;
+        _templates = templates;
+    }
+
+    public static ProjectSet Build(IEnumerable<Project> input)
+    {
+        var projects = new List<Project>();
+        var templates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in input)
+        {
+            string prefix = (p.Prefix ?? "").Trim();
+            if (prefix.Length == 0 || templates.ContainsKey(prefix)) continue; // skip blanks/dupes
+            string template = (p.UrlTemplate ?? "").Trim();
+            if (template.Length == 0) template = FallbackTemplate;
+            projects.Add(new Project { Prefix = prefix, UrlTemplate = template });
+            templates[prefix] = template;
+        }
+
+        Regex? pattern = null;
+        if (projects.Count > 0)
+        {
+            string alt = string.Join("|", projects.Select(p => Regex.Escape(p.Prefix)));
+            pattern = new Regex(@"(?<![A-Za-z0-9])(" + alt + @")-(\d+)$",
+                RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        }
+        return new ProjectSet(projects, pattern, templates);
+    }
+
+    public string BuildUrl(string prefix, string key)
+    {
+        string template = _templates.TryGetValue(prefix, out var t) ? t : FallbackTemplate;
+        return template.Contains("{KEY}") ? template.Replace("{KEY}", key) : template + key;
+    }
+}
+
+/// <summary>Loads/saves the project list as JSON in %APPDATA%\JiraLinker\projects.json.</summary>
+static class ConfigStore
+{
+    private static string Dir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "JiraLinker");
+    public static string Location => Path.Combine(Dir, "projects.json");
+
+    private static readonly JsonSerializerOptions JsonOpts =
+        new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
+
+    public static List<Project> Load()
+    {
+        try
+        {
+            if (File.Exists(Location))
+            {
+                var cfg = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(Location), JsonOpts);
+                if (cfg?.Projects is { Count: > 0 }) return cfg.Projects;
+            }
+        }
+        catch { /* fall through to defaults */ }
+
+        var defaults = Defaults();
+        Save(defaults); // seed on first run, or recover from a corrupt file
+        return defaults;
+    }
+
+    public static void Save(IEnumerable<Project> projects)
+    {
+        try
+        {
+            Directory.CreateDirectory(Dir);
+            var cfg = new AppConfig { Projects = projects.ToList() };
+            File.WriteAllText(Location, JsonSerializer.Serialize(cfg, JsonOpts));
+        }
+        catch { /* best effort */ }
+    }
+
+    private static List<Project> Defaults() => new()
+    {
+        new Project { Prefix = "CMMS", UrlTemplate = "https://herzog.atlassian.net/browse/{KEY}" },
+        new Project { Prefix = "MCP",  UrlTemplate = "https://herzog.atlassian.net/browse/{KEY}" },
+    };
+
+    public sealed class AppConfig { public List<Project> Projects { get; set; } = new(); }
+}
+
+/// <summary>Grid UI to add/edit/remove project prefixes and their URL templates.</summary>
+sealed class SettingsForm : Form
+{
+    private readonly DataGridView _grid;
+    private readonly Action<IEnumerable<Project>> _onSave;
+
+    public SettingsForm(List<Project> projects, Action<IEnumerable<Project>> onSave)
+    {
+        _onSave = onSave;
+
+        Text = "Jira Linker — Projects";
+        Width = 660;
+        Height = 400;
+        StartPosition = FormStartPosition.CenterScreen;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        Icon = SystemIcons.Information;
+
+        var info = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 52,
+            Padding = new Padding(12, 10, 12, 0),
+            Text = "Add the project prefixes you want auto-linked (e.g. CMMS, MCP). "
+                 + "In the URL, use {KEY} where the ticket id goes — e.g. https://herzog.atlassian.net/browse/{KEY}"
+        };
+
+        _grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = true,
+            AllowUserToDeleteRows = true,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            RowHeadersWidth = 30,
+            BackgroundColor = SystemColors.Window
+        };
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        { HeaderText = "Prefix", FillWeight = 22, MaxInputLength = 20 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        { HeaderText = "URL template  ({KEY} = ticket id)", FillWeight = 78 });
+
+        foreach (var p in projects)
+            _grid.Rows.Add(p.Prefix, p.UrlTemplate);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            FlowDirection = FlowDirection.RightToLeft,
+            Height = 52,
+            Padding = new Padding(10)
+        };
+        var save = new Button { Text = "Save", Width = 90 };
+        var cancel = new Button { Text = "Cancel", Width = 90 };
+        var remove = new Button { Text = "Remove selected", Width = 130 };
+        save.Click += (_, _) => OnSaveClicked();
+        cancel.Click += (_, _) => Close();
+        remove.Click += (_, _) => RemoveSelected();
+        buttons.Controls.Add(save);
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(remove);
+
+        Controls.Add(_grid);
+        Controls.Add(buttons);
+        Controls.Add(info);
+
+        AcceptButton = save;
+        CancelButton = cancel;
+    }
+
+    private void RemoveSelected()
+    {
+        foreach (DataGridViewRow row in _grid.SelectedRows)
+            if (!row.IsNewRow) _grid.Rows.Remove(row);
+    }
+
+    private void OnSaveClicked()
+    {
+        var result = new List<Project>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (DataGridViewRow row in _grid.Rows)
+        {
+            if (row.IsNewRow) continue;
+            string prefix = (row.Cells[0].Value as string ?? "").Trim();
+            string url = (row.Cells[1].Value as string ?? "").Trim();
+            if (prefix.Length == 0 && url.Length == 0) continue; // ignore fully blank rows
+
+            if (!Regex.IsMatch(prefix, "^[A-Za-z][A-Za-z0-9]*$"))
+            {
+                Warn($"Invalid prefix: \"{prefix}\".\nUse letters and digits only, starting with a letter (e.g. CMMS).");
+                return;
+            }
+            if (url.Length == 0)
+            {
+                Warn($"Project \"{prefix}\" needs a URL template.");
+                return;
+            }
+            if (!seen.Add(prefix))
+            {
+                Warn($"Duplicate prefix: \"{prefix}\". Each prefix can only appear once.");
+                return;
+            }
+            result.Add(new Project { Prefix = prefix.ToUpperInvariant(), UrlTemplate = url });
+        }
+
+        _onSave(result);
+        Close();
+    }
+
+    private void Warn(string message) =>
+        MessageBox.Show(this, message, "Jira Linker", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 }

@@ -47,22 +47,29 @@ Output is a single self-contained `dist\JiraLinker.exe` (~110 MB, bundles the ru
 
 ---
 
-## Customize
+## Manage projects (no rebuild needed)
 
-Everything lives in [`Program.cs`](Program.cs):
+Right-click the tray icon → **Manage projects…** (or double-click the icon). A grid lets you **add, edit, and remove** project prefixes and the URL each one links to:
 
-- **Add/change projects** — edit the regex in the `KeyHook` class:
-  ```csharp
-  new(@"(?<![A-Za-z0-9])(CMMS|MCP)-(\d+)$", ...)
-  ```
-  Add prefixes with `|`, e.g. `(CMMS|MCP|OPS|IT)`.
-- **Change the Jira base URL** — edit:
-  ```csharp
-  private const string BaseUrl = "https://herzog.atlassian.net/browse/";
-  ```
-- **Change trigger behavior** — the trigger is "any printable non-token character" (see `TryGetPrintableChar(...)` plus the Enter/Tab handling in `HookCallback`). Token characters (letters, digits, `-`) are defined in `BufferChar(...)`.
+| Prefix | URL template ({KEY} = ticket id) |
+|--------|----------------------------------|
+| CMMS   | `https://herzog.atlassian.net/browse/{KEY}` |
+| MCP    | `https://herzog.atlassian.net/browse/{KEY}` |
 
-Rebuild with `scripts\build.ps1` after any change.
+- Type in the blank bottom row to add a project; select a row and **Remove selected** to delete.
+- `{KEY}` is replaced with the full ticket id (e.g. `CMMS-2747`). Different projects can point to entirely different URLs.
+- **Save** applies changes immediately — no restart or rebuild.
+
+Settings are stored at `%APPDATA%\JiraLinker\projects.json` (seeded with CMMS + MCP on first run). You can hand-edit that file too.
+
+## Customize (code)
+
+The trigger behavior lives in [`Program.cs`](Program.cs):
+
+- **Trigger** — "any printable non-token character" (see `TryGetPrintableChar(...)` plus Enter/Tab handling in `HookCallback`). Token characters (letters, digits, `-`) are defined in `BufferChar(...)`.
+- **Default projects** — `ConfigStore.Defaults()` (used only on first run / if the config is missing).
+
+Rebuild with `scripts\build.ps1` after any code change.
 
 ---
 
