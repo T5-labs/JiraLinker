@@ -68,6 +68,10 @@ The trigger behavior lives in [`Program.cs`](Program.cs):
 
 - **Trigger** — "any printable non-token character" (see `TryGetPrintableChar(...)` plus Enter/Tab handling in `HookCallback`). Token characters (letters, digits, `-`) are defined in `BufferChar(...)`.
 - **Default projects** — `ConfigStore.Defaults()` (used only on first run / if the config is missing).
+- **App icon** — replace `assets\icon-source.png`, then regenerate the multi-size icon:
+  ```powershell
+  .\scripts\make-icon.ps1   # -> assets\app.ico (used by the exe, tray, and window)
+  ```
 
 Rebuild with `scripts\build.ps1` after any code change.
 

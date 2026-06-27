@@ -41,7 +41,7 @@ sealed class TrayContext : ApplicationContext
         toggle.CheckedChanged += (_, _) =>
         {
             _hook.Enabled = toggle.Checked;
-            _icon.Text = toggle.Checked ? "Jira Linker — on" : "Jira Linker — paused";
+            _icon.Text = toggle.Checked ? "Jira Linker - On" : "Jira Linker - Off";
         };
         menu.Items.Add(toggle);
 
@@ -59,13 +59,30 @@ sealed class TrayContext : ApplicationContext
 
         _icon = new NotifyIcon
         {
-            Icon = SystemIcons.Information,
+            Icon = AppIcons.Tray(),
             Visible = true,
-            Text = "Jira Linker — on",
+            Text = "Jira Linker - On",
             ContextMenuStrip = menu
         };
-        // Double-clicking the tray icon opens the project manager too.
-        _icon.DoubleClick += (_, _) => ShowSettings();
+        // Open the menu on a single left-click (not just right-click).
+        _icon.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) ShowTrayMenu();
+        };
+    }
+
+    // NotifyIcon only opens its menu on right-click by default; invoke the same
+    // internal routine on left-click so a single left-click works identically.
+    private static readonly System.Reflection.MethodInfo? ShowContextMenuMethod =
+        typeof(NotifyIcon).GetMethod("ShowContextMenu",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+    private void ShowTrayMenu()
+    {
+        if (ShowContextMenuMethod != null)
+            ShowContextMenuMethod.Invoke(_icon, null);
+        else
+            _icon.ContextMenuStrip?.Show(Cursor.Position);
     }
 
     private void ShowSettings()
@@ -501,6 +518,40 @@ sealed class KeyHook : IDisposable
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
 }
 
+/// <summary>Loads the embedded app.ico at the requested size for the tray and windows.</summary>
+static class AppIcons
+{
+    private static byte[]? _bytes;
+
+    private static byte[] Bytes()
+    {
+        if (_bytes != null) return _bytes;
+        var asm = typeof(AppIcons).Assembly;
+        var name = asm.GetManifestResourceNames()
+            .FirstOrDefault(n => n.EndsWith("app.ico", StringComparison.OrdinalIgnoreCase));
+        if (name != null)
+        {
+            using var s = asm.GetManifestResourceStream(name)!;
+            using var ms = new MemoryStream();
+            s.CopyTo(ms);
+            _bytes = ms.ToArray();
+        }
+        else _bytes = Array.Empty<byte>();
+        return _bytes;
+    }
+
+    private static Icon Load(int size)
+    {
+        var b = Bytes();
+        if (b.Length == 0) return (Icon)SystemIcons.Information.Clone();
+        using var ms = new MemoryStream(b);
+        return new Icon(ms, new Size(size, size));
+    }
+
+    public static Icon Tray() => Load(SystemInformation.SmallIconSize.Width); // 16px (DPI-aware)
+    public static Icon Window() => Load(32);
+}
+
 /// <summary>One project prefix and the URL it links to. {KEY} = the full ticket id.</summary>
 sealed class Project
 {
@@ -619,7 +670,7 @@ sealed class SettingsForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimizeBox = false;
         MaximizeBox = false;
-        Icon = SystemIcons.Information;
+        Icon = AppIcons.Window();
 
         var info = new Label
         {

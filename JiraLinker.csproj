@@ -10,6 +10,12 @@
     <RootNamespace>JiraLinker</RootNamespace>
     <Version>1.0.0</Version>
     <Product>Jira Linker</Product>
+    <ApplicationIcon>assets\app.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Embedded so the tray icon and settings window can load it at runtime. -->
+    <EmbeddedResource Include="assets\app.ico" />
+  </ItemGroup>
 
 </Project>
