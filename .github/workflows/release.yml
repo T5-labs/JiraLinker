@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    # Primary path: `git tag v1.0.1 && git push --tags`.
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    # Manual path from the Actions tab when no tag was pushed.
+    inputs:
+      version:
+        description: 'Release version, e.g. v1.0.1'
+        required: true
+        type: string
+
+# Needed for softprops/action-gh-release to create the release via the built-in GITHUB_TOKEN.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # net10.0-windows WinForms can only build on Windows.
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # Default to GA since the app already builds locally with a .NET 10 SDK.
+          dotnet-version: '10.0.x'
+
+      - name: Build single-file exe
+        # Reuse the existing build script (single source of truth). Its $PSScriptRoot
+        # paths resolve to repo root and it writes dist/JiraLinker.exe. The
+        # Get-Process/Stop-Process line is a harmless no-op on the runner.
+        shell: pwsh
+        run: ./scripts/build.ps1
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JiraLinker-exe
+          path: dist/JiraLinker.exe
+
+      - name: Resolve tag
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        id: tag
+        # Tag-push -> github.ref_name; manual dispatch -> the `version` input.
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ github.event.inputs.version }}' } else { '${{ github.ref_name }}' }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: JiraLinker ${{ steps.tag.outputs.tag }}
+          files: dist/JiraLinker.exe
+          generate_release_notes: true
+          body: |
+            Unsigned, self-installing Windows executable.
+
+            Download `JiraLinker.exe` and double-click it to install. On first run Windows
+            SmartScreen may warn about an unrecognized app — choose **More info → Run anyway**.
