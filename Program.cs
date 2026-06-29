@@ -8,18 +8,121 @@ namespace JiraLinker;
 
 static class Program
 {
+    // Canonical install location, kept identical to scripts\install.ps1 so the script
+    // and the self-installer stay interchangeable.
+    public static string InstallDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "JiraLinker");
+    public static string InstalledExe => Path.Combine(InstallDir, "JiraLinker.exe");
+    public static string StartupShortcut =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "JiraLinker.lnk");
+
     [STAThread]
     static void Main()
     {
+        // Must run before any window (incl. a MessageBox) is created, else
+        // SetCompatibleTextRenderingDefault throws — so do this before the installer prompt.
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+
+        // Self-install decision happens BEFORE the single-instance mutex: when we install
+        // and relaunch, the freshly copied exe needs to claim that same named mutex, so this
+        // process must not still be holding it. Returns false => this process should exit.
+        if (!MaybeSelfInstall())
+            return;
+
         // Single-instance guard so login auto-start + manual launch don't double up.
         using var mutex = new Mutex(true, "JiraLinker_SingleInstance", out bool isNew);
         if (!isNew)
             return;
 
-        Application.EnableVisualStyles();
-        Application.SetCompatibleTextRenderingDefault(false);
         using var ctx = new TrayContext();
         Application.Run(ctx);
+    }
+
+    /// <summary>
+    /// Offers to install a downloaded copy to the canonical location and auto-start it.
+    /// Returns true to continue normal startup in THIS process; false if this process
+    /// should exit (installed-and-relaunched, or the user cancelled).
+    /// </summary>
+    private static bool MaybeSelfInstall()
+    {
+        // Environment.ProcessPath is correct under PublishSingleFile (ExecutablePath can
+        // point at the extracted host); fall back just in case it is ever null.
+        string currentExe = Environment.ProcessPath ?? Application.ExecutablePath;
+
+        // Already the installed copy (login autostart or our own post-install relaunch):
+        // never prompt, just run.
+        if (PathsEqual(currentExe, InstalledExe))
+            return true;
+
+        var choice = MessageBox.Show(
+            "Install JiraLinker and run it automatically when you sign in?",
+            "JiraLinker", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+
+        if (choice == DialogResult.Cancel)
+            return false;        // exit without running
+        if (choice == DialogResult.No)
+            return true;         // run from the current location for this session
+
+        try
+        {
+            Directory.CreateDirectory(InstallDir);
+            StopOtherInstances(); // release any lock on the target file before overwriting
+            File.Copy(currentExe, InstalledExe, overwrite: true);
+            CreateStartupShortcut(InstalledExe, InstallDir);
+            Process.Start(new ProcessStartInfo { FileName = InstalledExe, WorkingDirectory = InstallDir, UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Could not install JiraLinker:\n\n" + ex.Message,
+                "JiraLinker", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+        return false; // the installed copy now runs; this one exits
+    }
+
+    /// <summary>Kills any OTHER JiraLinker process so the install target isn't file-locked.</summary>
+    private static void StopOtherInstances()
+    {
+        int me = Environment.ProcessId;
+        foreach (var p in Process.GetProcessesByName("JiraLinker"))
+        {
+            try { if (p.Id != me) { p.Kill(); p.WaitForExit(2000); } }
+            catch { /* already gone or access denied — best effort */ }
+            finally { p.Dispose(); }
+        }
+    }
+
+    /// <summary>Creates/refreshes the Startup .lnk via late-bound WScript.Shell COM (mirrors install.ps1, no NuGet).</summary>
+    private static void CreateStartupShortcut(string targetExe, string workingDir)
+    {
+        Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+        if (shellType == null) throw new InvalidOperationException("WScript.Shell COM is unavailable.");
+
+        dynamic shell = Activator.CreateInstance(shellType)!;
+        try
+        {
+            dynamic sc = shell.CreateShortcut(StartupShortcut);
+            sc.TargetPath = targetExe;
+            sc.WorkingDirectory = workingDir;
+            sc.Description = "Jira Linker - auto-hyperlink Jira ticket keys";
+            sc.Save();
+            Marshal.FinalReleaseComObject(sc);
+        }
+        finally { Marshal.FinalReleaseComObject(shell); }
+    }
+
+    /// <summary>Case-insensitive, normalized path comparison (fails closed on bad paths).</summary>
+    private static bool PathsEqual(string a, string b)
+    {
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(a).TrimEnd('\\'),
+                Path.GetFullPath(b).TrimEnd('\\'),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 }
 
@@ -50,6 +153,12 @@ sealed class TrayContext : ApplicationContext
         var manage = new ToolStripMenuItem("Manage projects…");
         manage.Click += (_, _) => ShowSettings();
         menu.Items.Add(manage);
+
+        menu.Items.Add(new ToolStripSeparator());
+
+        var uninstall = new ToolStripMenuItem("Uninstall");
+        uninstall.Click += (_, _) => Uninstall();
+        menu.Items.Add(uninstall);
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -92,9 +201,45 @@ sealed class TrayContext : ApplicationContext
             _settings.Activate();
             return;
         }
-        _settings = new SettingsForm(_hook.GetProjects(), _hook.SetProjects);
+        _settings = new SettingsForm(_hook.GetProjects(), _hook.GetSuppressChars(), _hook.SetConfig);
         _settings.Show();
         _settings.Activate();
+    }
+
+    /// <summary>
+    /// Removes the Startup shortcut and the install folder. User config in
+    /// %APPDATA%\JiraLinker (projects.json) is intentionally left, matching uninstall.ps1.
+    /// </summary>
+    private void Uninstall()
+    {
+        if (MessageBox.Show(
+                "Remove JiraLinker? It will stop running and no longer start with Windows.",
+                "JiraLinker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+
+        try { if (File.Exists(Program.StartupShortcut)) File.Delete(Program.StartupShortcut); }
+        catch { /* best effort — still remove the install dir below */ }
+
+        try
+        {
+            // A running exe can't delete its own folder, so hand the deletion to a detached
+            // cmd that waits a moment (ping = portable sleep) for us to exit, then removes it.
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c ping 127.0.0.1 -n 3 >nul & rd /s /q \"{Program.InstallDir}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Could not complete uninstall:\n\n" + ex.Message,
+                "JiraLinker", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        ExitThread();
     }
 
     protected override void Dispose(bool disposing)
@@ -121,7 +266,12 @@ sealed class KeyHook : IDisposable
 {
     // Current set of project prefixes -> URL templates, compiled into one regex.
     // Swapped atomically when the user edits projects (read on the same UI thread).
-    private ProjectSet _projects = ProjectSet.Build(ConfigStore.Load());
+    private ProjectSet _projects;
+
+    // Characters that, typed immediately after a ticket token, suppress linkification
+    // (leave the ticket as plain text). Swapped atomically alongside _projects; empty
+    // by default so existing installs are unchanged. Whitespace is never included.
+    private HashSet<char> _suppress;
 
     private readonly LowLevelKeyboardProc _proc; // kept alive to avoid GC of the callback
     private IntPtr _hookId = IntPtr.Zero;
@@ -139,10 +289,18 @@ sealed class KeyHook : IDisposable
 
     public KeyHook()
     {
+        var cfg = ConfigStore.Load();
+        _projects = ProjectSet.Build(cfg.Projects);
+        _suppress = BuildSuppressSet(cfg.SuppressChars);
+
         _proc = HookCallback;
         _restoreTimer = new System.Windows.Forms.Timer { Interval = 300 };
         _restoreTimer.Tick += (_, _) => { _restoreTimer.Stop(); RestoreClipboard(); };
     }
+
+    /// <summary>Builds the lookup set, dropping whitespace (space is never a suppressor).</summary>
+    private static HashSet<char> BuildSuppressSet(string? chars) =>
+        new((chars ?? "").Where(c => !char.IsWhiteSpace(c)));
 
     public void Install()
     {
@@ -157,12 +315,16 @@ sealed class KeyHook : IDisposable
     /// <summary>A copy of the current projects, for display/editing in the UI.</summary>
     public List<Project> GetProjects() => _projects.Projects.Select(p => p.Clone()).ToList();
 
-    /// <summary>Applies an edited project list: recompiles the matcher and saves to disk.</summary>
-    public void SetProjects(IEnumerable<Project> projects)
+    /// <summary>The current suppress characters as a string, for display/editing in the UI.</summary>
+    public string GetSuppressChars() => new(_suppress.ToArray());
+
+    /// <summary>Applies edited config: recompiles the matcher, swaps the suppress set, saves to disk.</summary>
+    public void SetConfig(IEnumerable<Project> projects, string suppressChars)
     {
         var list = projects.ToList();
         _projects = ProjectSet.Build(list);
-        ConfigStore.Save(list);
+        _suppress = BuildSuppressSet(suppressChars);
+        ConfigStore.Save(new ConfigStore.AppConfig { Projects = list, SuppressChars = suppressChars ?? "" });
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -225,6 +387,14 @@ sealed class KeyHook : IDisposable
             var m = projects.Pattern?.Match(_buf.ToString());
             if (m is { Success: true })
             {
+                // A user-configured "special" char right after the token suppresses linking:
+                // leave the ticket as plain text and let the char type through normally.
+                if (isPrintable && _suppress.Contains(triggerChar))
+                {
+                    _buf.Clear();
+                    return CallNextHookEx(_hookId, nCode, wParam, lParam);
+                }
+
                 string prefix = m.Groups[1].Value.ToUpperInvariant();
                 string display = prefix + "-" + m.Groups[2].Value;
                 string url = projects.BuildUrl(prefix, display);
@@ -617,29 +787,28 @@ static class ConfigStore
     private static readonly JsonSerializerOptions JsonOpts =
         new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
 
-    public static List<Project> Load()
+    public static AppConfig Load()
     {
         try
         {
             if (File.Exists(Location))
             {
                 var cfg = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(Location), JsonOpts);
-                if (cfg?.Projects is { Count: > 0 }) return cfg.Projects;
+                if (cfg?.Projects is { Count: > 0 }) return cfg; // SuppressChars defaults to "" if absent
             }
         }
         catch { /* fall through to defaults */ }
 
-        var defaults = Defaults();
+        var defaults = new AppConfig { Projects = Defaults() };
         Save(defaults); // seed on first run, or recover from a corrupt file
         return defaults;
     }
 
-    public static void Save(IEnumerable<Project> projects)
+    public static void Save(AppConfig cfg)
     {
         try
         {
             Directory.CreateDirectory(Dir);
-            var cfg = new AppConfig { Projects = projects.ToList() };
             File.WriteAllText(Location, JsonSerializer.Serialize(cfg, JsonOpts));
         }
         catch { /* best effort */ }
@@ -651,16 +820,23 @@ static class ConfigStore
         new Project { Prefix = "MCP",  UrlTemplate = "https://herzog.atlassian.net/browse/{KEY}" },
     };
 
-    public sealed class AppConfig { public List<Project> Projects { get; set; } = new(); }
+    public sealed class AppConfig
+    {
+        public List<Project> Projects { get; set; } = new();
+        // Chars that suppress linking when typed right after a token. Optional in JSON:
+        // System.Text.Json leaves it "" for configs written before this field existed.
+        public string SuppressChars { get; set; } = "";
+    }
 }
 
 /// <summary>Grid UI to add/edit/remove project prefixes and their URL templates.</summary>
 sealed class SettingsForm : Form
 {
     private readonly DataGridView _grid;
-    private readonly Action<IEnumerable<Project>> _onSave;
+    private readonly TextBox _suppressBox;
+    private readonly Action<IEnumerable<Project>, string> _onSave;
 
-    public SettingsForm(List<Project> projects, Action<IEnumerable<Project>> onSave)
+    public SettingsForm(List<Project> projects, string suppressChars, Action<IEnumerable<Project>, string> onSave)
     {
         _onSave = onSave;
 
@@ -716,7 +892,29 @@ sealed class SettingsForm : Form
         buttons.Controls.Add(cancel);
         buttons.Controls.Add(remove);
 
+        var suppressPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Height = 40,
+            Padding = new Padding(12, 8, 12, 8)
+        };
+        var suppressLabel = new Label
+        {
+            Text = "Don't link if followed by any of these characters (space excluded):",
+            AutoSize = true,
+            Margin = new Padding(0, 5, 8, 0)
+        };
+        _suppressBox = new TextBox { Width = 160, Text = suppressChars ?? "" };
+        suppressPanel.Controls.Add(suppressLabel);
+        suppressPanel.Controls.Add(_suppressBox);
+
+        // Dock order matters: the Fill control is added first so it takes the
+        // remaining space; the two Bottom panels are added last, buttons after
+        // suppressPanel so buttons sit at the very bottom and suppressPanel above them.
         Controls.Add(_grid);
+        Controls.Add(suppressPanel);
         Controls.Add(buttons);
         Controls.Add(info);
 
@@ -760,7 +958,11 @@ sealed class SettingsForm : Form
             result.Add(new Project { Prefix = prefix.ToUpperInvariant(), UrlTemplate = url });
         }
 
-        _onSave(result);
+        // Strip whitespace (space must stay a normal trigger) and de-dupe the suppress chars.
+        string suppress = new((_suppressBox.Text ?? "")
+            .Where(c => !char.IsWhiteSpace(c)).Distinct().ToArray());
+
+        _onSave(result, suppress);
         Close();
     }
 
